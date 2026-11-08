@@ -51,7 +51,11 @@ from winrt.microsoft.ui.xaml.markup import (
 )
 from winrt.microsoft.ui.xaml.media import MicaBackdrop
 from winrt.microsoft.ui.xaml.xamltypeinfo import XamlControlsXamlMetaDataProvider
-from winrt.microsoft.ui.windowing import OverlappedPresenter, TitleBarTheme
+from winrt.microsoft.ui.windowing import (
+    IconShowOptions,
+    OverlappedPresenter,
+    TitleBarTheme,
+)
 from winrt.microsoft.windows.applicationmodel.dynamicdependency.bootstrap import (
     InitializeOptions,
     initialize,
@@ -363,18 +367,20 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         register_hotkey()
 
         self._window = Window()
-        self._window.title = "Expreload"
+        self._window.title = ""
         self._window.system_backdrop = MicaBackdrop()
+        self._window.extends_content_into_title_bar = True
 
         presenter = OverlappedPresenter.create()
         presenter.is_maximizable = False
+        presenter.is_minimizable = True
         presenter.is_resizable = False
         self._window.app_window.set_presenter(presenter)
 
         self._window.app_window.resize((WINDOW_WIDTH, WINDOW_HEIGHT))
         if os.path.exists(icon_path()):
-            self._window.app_window.set_icon(icon_path())
             self._window.app_window.set_taskbar_icon(icon_path())
+        self._hide_title_bar_icon(self._window)
 
         self._window.app_window.add_closing(self._on_closing)
         built = self._build_ui()
@@ -389,6 +395,14 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
 
         self._apply_state(self._monitor.is_explorer_running())
 
+    def _hide_title_bar_icon(self, win):
+        try:
+            win.app_window.title_bar.icon_show_options = (
+                IconShowOptions.HIDE_ICON_AND_SYSTEM_MENU
+            )
+        except Exception as e:
+            print(f"[Expreload] 隐藏标题栏图标失败: {e}", flush=True)
+
     def _text(self, content, size, brush_key, weight=None):
         tb = TextBlock()
         tb.text = content
@@ -402,11 +416,17 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
     def _build_ui(self):
         self._root_host = Grid()
         inner = Grid()
-        inner.padding = Thickness(24, 20, 24, 20)
+        inner.padding = Thickness(24, 48, 24, 20)
         inner.children.append(self._build_main_page())
         self._root_host.children.append(inner)
         self._inner_host = inner
         return self._root_host
+
+    def _close_main_window(self):
+        try:
+            self._window.app_window.hide()
+        except Exception as e:
+            print(f"[Expreload] 隐藏窗口失败: {e}", flush=True)
 
     def _build_main_page(self):
         grid = Grid()
@@ -526,22 +546,24 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
                 self._settings_window = None
 
         win = Window()
-        win.title = "设置"
+        win.title = ""
         win.system_backdrop = MicaBackdrop()
+        win.extends_content_into_title_bar = True
 
         presenter = OverlappedPresenter.create()
         presenter.is_maximizable = False
-        presenter.is_minimizable = False
+        presenter.is_minimizable = True
         presenter.is_resizable = False
         win.app_window.set_presenter(presenter)
         win.app_window.resize((SETTINGS_WIDTH, SETTINGS_HEIGHT))
         if os.path.exists(icon_path()):
-            win.app_window.set_icon(icon_path())
             win.app_window.set_taskbar_icon(icon_path())
+        self._hide_title_bar_icon(win)
 
         page = self._build_settings_page(win)
         outer = Grid()
         outer.children.append(page)
+
         self._settings_root = outer
         self._settings_inner = page
         win.content = outer
@@ -550,6 +572,13 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         self._apply_theme_to_window(win)
         win.activate()
 
+    def _close_settings_window(self):
+        try:
+            if self._settings_window is not None:
+                self._settings_window.close()
+        except Exception as e:
+            print(f"[Expreload] 关闭设置窗口失败: {e}", flush=True)
+
     def _on_settings_closed(self, sender, args):
         self._settings_window = None
         self._settings_root = None
@@ -557,7 +586,7 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
 
     def _build_settings_page(self, win):
         grid = Grid()
-        grid.padding = Thickness(24, 20, 24, 20)
+        grid.padding = Thickness(24, 48, 24, 20)
         grid.row_definitions.append(_row(GridUnitType.AUTO))
         grid.row_definitions.append(_row(GridUnitType.STAR))
         grid.row_definitions.append(_row(GridUnitType.AUTO))
