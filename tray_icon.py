@@ -207,9 +207,13 @@ class TrayIcon:
 
     def _invoke(self, fn):
         try:
+            print(f"[Expreload] 托盘动作调用: {fn!r}", flush=True)
             fn()
         except Exception as e:
             print(f"[Expreload] 托盘动作失败: {e}", flush=True)
+            import traceback
+
+            traceback.print_exc()
 
     def _popup(self, hwnd):
         menu = win32gui.CreatePopupMenu()

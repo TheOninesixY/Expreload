@@ -854,7 +854,10 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
 
     def _run_on_ui(self, fn):
         queue = self._window.dispatcher_queue
-        if queue.has_thread_access():
+        has_access = queue.has_thread_access
+        if callable(has_access):
+            has_access = has_access()
+        if has_access:
             fn()
         else:
             queue.try_enqueue(fn)
