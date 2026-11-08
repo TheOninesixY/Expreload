@@ -1,5 +1,5 @@
 psutil>=7.0
-pystray>=0.19
+pywin32>=306
 keyboard>=0.13
 Pillow>=10.0
 typing_extensions>=4.12

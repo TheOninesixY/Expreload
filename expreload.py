@@ -7,9 +7,6 @@ import threading
 
 import psutil
 import keyboard
-from PIL import Image
-import pystray
-from pystray import MenuItem, Menu
 from typing_extensions import override
 
 from winrt.microsoft.ui.xaml import (
@@ -67,7 +64,6 @@ EXPLORER_NAME = "explorer.exe"
 MONITOR_INTERVAL = 2
 MISSING_THRESHOLD = 10
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-ICON_PATH = os.path.join(APP_DIR, "expreload.ico")
 VERSION_PATH = os.path.join(APP_DIR, "VERSION.md")
 
 FALLBACK_VERSION = "unknown"
@@ -92,6 +88,10 @@ BODY_BACKGROUND = "ApplicationPageBackgroundThemeBrush"
 def _resource_path(name):
     base = getattr(sys, "_MEIPASS", APP_DIR)
     return os.path.join(base, name)
+
+
+def icon_path():
+    return _resource_path("expreload.ico")
 
 
 def read_version_info():
@@ -277,68 +277,46 @@ def register_hotkey():
         print(f"[Expreload] 快捷键注册失败: {e}")
 
 
-def _patch_pystray_message_filter():
+def start_tray(icon):
     try:
-        import pystray._util.win32 as w
+        icon.start()
+        print("[Expreload] 托盘图标已启动", flush=True)
     except Exception as e:
-        print(f"[Expreload] 无法加载 pystray win32 后端: {e}")
-        return
-
-    original = getattr(w, "ChangeWindowMessageFilterEx", None)
-    if original is None:
-        return
-    if getattr(original, "_expreload_patched", False):
-        return
-
-    def safe_filter(*args, **kwargs):
+        print(f"[Expreload] 托盘图标启动失败: {e}", flush=True)
         try:
-            return original(*args, **kwargs)
-        except Exception as e:
-            print(f"[Expreload] 跳过消息过滤设置(非提权运行): {e}")
-            return True
+            import ctypes
 
-    safe_filter._expreload_patched = True
-    w.ChangeWindowMessageFilterEx = safe_filter
-
-
-def run_tray_icon(icon):
-    try:
-        import ctypes
-
-        ctypes.windll.ole32.CoInitializeEx(None, 0x2)
-    except Exception as e:
-        print(f"[Expreload] 托盘线程 COM 初始化失败: {e}")
-    _patch_pystray_message_filter()
-    try:
-        icon.run()
-    except Exception as e:
-        print(f"[Expreload] 托盘图标启动失败: {e}")
-        import traceback
-
-        traceback.print_exc()
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                str(e),
+                "Expreload 托盘错误",
+                0x00000010,
+            )
+        except Exception:
+            pass
 
 
 def create_tray_icon(app, monitor):
-    image = Image.new("RGB", (64, 64), color=(58, 130, 246))
-    if os.path.exists(ICON_PATH):
-        image = Image.open(ICON_PATH)
+    from tray_icon import TrayIcon
 
-    def on_open(icon, item):
+    def on_open():
         app.show_window()
 
-    def on_exit(icon, item):
+    def on_restart():
+        threading.Thread(target=restart_explorer, daemon=True).start()
+
+    def on_exit():
         monitor.stop()
         keyboard.unhook_all_hotkeys()
-        icon.stop()
         os._exit(0)
 
-    menu = Menu(
-        MenuItem("打开主界面", on_open, default=True),
-        MenuItem("重启 Explorer", lambda icon, item: restart_explorer()),
-        Menu.SEPARATOR,
-        MenuItem("退出", on_exit),
+    return TrayIcon(
+        "Expreload - Explorer 守护",
+        icon_path(),
+        on_open,
+        on_restart,
+        on_exit,
     )
-    return pystray.Icon("Expreload", image, "Expreload - Explorer 守护", menu)
 
 
 def _col(unit):
@@ -394,9 +372,9 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         self._window.app_window.set_presenter(presenter)
 
         self._window.app_window.resize((WINDOW_WIDTH, WINDOW_HEIGHT))
-        if os.path.exists(ICON_PATH):
-            self._window.app_window.set_icon(ICON_PATH)
-            self._window.app_window.set_taskbar_icon(ICON_PATH)
+        if os.path.exists(icon_path()):
+            self._window.app_window.set_icon(icon_path())
+            self._window.app_window.set_taskbar_icon(icon_path())
 
         self._window.app_window.add_closing(self._on_closing)
         built = self._build_ui()
@@ -406,7 +384,7 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
 
         self._tray_icon = create_tray_icon(self, self._monitor)
         threading.Thread(
-            target=run_tray_icon, args=(self._tray_icon,), daemon=True
+            target=start_tray, args=(self._tray_icon,), daemon=True
         ).start()
 
         self._apply_state(self._monitor.is_explorer_running())
@@ -557,9 +535,9 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         presenter.is_resizable = False
         win.app_window.set_presenter(presenter)
         win.app_window.resize((SETTINGS_WIDTH, SETTINGS_HEIGHT))
-        if os.path.exists(ICON_PATH):
-            win.app_window.set_icon(ICON_PATH)
-            win.app_window.set_taskbar_icon(ICON_PATH)
+        if os.path.exists(icon_path()):
+            win.app_window.set_icon(icon_path())
+            win.app_window.set_taskbar_icon(icon_path())
 
         page = self._build_settings_page(win)
         outer = Grid()
@@ -719,7 +697,7 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         if self._tray_icon is None:
             self._tray_icon = create_tray_icon(self, self._monitor)
             threading.Thread(
-                target=run_tray_icon, args=(self._tray_icon,), daemon=True
+                target=start_tray, args=(self._tray_icon,), daemon=True
             ).start()
         self._apply_state(self._monitor.is_explorer_running())
 
@@ -869,7 +847,89 @@ def init(params: ApplicationInitializationCallbackParams) -> None:
     ExpreloadApp()
 
 
+ERROR_CANCELLED = 1223
+
+
+def is_elevated():
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            params = ""
+        else:
+            exe = sys.executable
+            params = subprocess.list2cmdline([os.path.abspath(__file__)])
+
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.ShellExecuteW.argtypes = [
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+        shell32.ShellExecuteW.restype = wintypes.HINSTANCE
+
+        ctypes.set_last_error(0)
+        ret = shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        err = ctypes.get_last_error()
+
+        if ret <= 32:
+            return err
+        return 0
+    except Exception:
+        return -1
+
+
+def show_error(message, title="Expreload"):
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(0, message, title, 0x00000010)
+    except Exception:
+        print(f"[Expreload] {message}", flush=True)
+
+
+def ensure_admin():
+    if is_elevated():
+        return True
+
+    err = relaunch_as_admin()
+
+    if err == ERROR_CANCELLED:
+        show_error(
+            "Expreload 需要管理员权限才能正常显示托盘图标。\n\n"
+            "你取消了权限请求，程序将退出。",
+            "Expreload 需要管理员权限",
+        )
+    elif err == 0:
+        pass
+    else:
+        show_error(
+            "Expreload 需要管理员权限，但请求提权失败。\n\n"
+            f"错误代码：{err}\n\n程序将退出。",
+            "Expreload 提权失败",
+        )
+
+    return False
+
+
 def main():
+    if not ensure_admin():
+        return
+
     init_apartment(ApartmentType.SINGLE_THREADED)
     with initialize(options=InitializeOptions.ON_NO_MATCH_SHOW_UI):
         Application.start(init)
