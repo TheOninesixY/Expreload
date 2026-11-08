@@ -1,2 +1,2 @@
 # Expreload
-Explorer 炸了？Expreload 来救
+简约的Explorer守护器

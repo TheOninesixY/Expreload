@@ -1,0 +1,22 @@
+psutil>=7.0
+pystray>=0.19
+keyboard>=0.13
+Pillow>=10.0
+typing_extensions>=4.12
+
+# PyWinRT 4.x —— WinUI 3 / Windows App SDK 绑定
+winrt-runtime>=4.0,<5
+winrt-Windows.Foundation>=4!10.0.28000
+winrt-Windows.Foundation.Collections>=4!10.0.28000
+winrt-Windows.Storage.Streams>=4!10.0.28000
+winrt-Windows.UI>=4!10.0.28000
+winrt-Windows.UI.Xaml>=4!10.0.28000
+winrt-Windows.UI.Xaml.Interop>=4!10.0.28000
+winrt-Windows.Graphics>=4!10.0.28000
+winrt-Microsoft.WindowsAppSDK.Foundation>=4!2.6.4
+winrt-Microsoft.WindowsAppSDK.InteractiveExperiences>=4!2.6.4
+winrt-Microsoft.WindowsAppSDK.WinUI>=4!2.6.4
+winrt-Microsoft.WindowsAppRuntime.Bootstrap>=4!2.6.4
+
+# 构建工具
+pyinstaller>=6.0

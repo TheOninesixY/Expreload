@@ -1,4 +1,6 @@
 import os
+import re
+import sys
 import time
 import subprocess
 import threading
@@ -35,12 +37,16 @@ from winrt.microsoft.ui.xaml.controls import (
     InfoBarSeverity,
     Orientation,
     ProgressRing,
+    RichTextBlock,
     RowDefinition,
+    ScrollBarVisibility,
     StackPanel,
+    ScrollViewer,
     TextBlock,
     ToggleSwitch,
     XamlControlsResources,
 )
+from winrt.microsoft.ui.xaml.documents import Paragraph, Run
 from winrt.microsoft.ui.xaml.markup import (
     IXamlMetadataProvider,
     IXamlType,
@@ -60,7 +66,11 @@ from winrt.windows.ui.xaml.interop import TypeKind, TypeName
 EXPLORER_NAME = "explorer.exe"
 MONITOR_INTERVAL = 2
 MISSING_THRESHOLD = 10
-ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expreload.ico")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ICON_PATH = os.path.join(APP_DIR, "expreload.ico")
+VERSION_PATH = os.path.join(APP_DIR, "VERSION.md")
+
+FALLBACK_VERSION = "unknown"
 
 # 窗口初始大小
 WINDOW_WIDTH = 400
@@ -68,7 +78,7 @@ WINDOW_HEIGHT = 270
 
 # 设置窗口大小
 SETTINGS_WIDTH = 400
-SETTINGS_HEIGHT = 320
+SETTINGS_HEIGHT = 400
 
 # 监护关闭时窗口高度
 MINIMODE_HEIGHT = 130
@@ -79,6 +89,123 @@ TEXT_TERTIARY = "TextFillColorTertiaryBrush"
 BODY_BACKGROUND = "ApplicationPageBackgroundThemeBrush"
 
 
+def _resource_path(name):
+    base = getattr(sys, "_MEIPASS", APP_DIR)
+    return os.path.join(base, name)
+
+
+def read_version_info():
+    version = FALLBACK_VERSION
+    changelog = ""
+    path = _resource_path("VERSION.md")
+    if not os.path.exists(path):
+        return version, changelog
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read().splitlines()
+    except OSError:
+        return version, changelog
+    lines = [ln.rstrip() for ln in raw]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines:
+        return version, changelog
+    version = lines[0].strip()
+    rest = lines[1:]
+    while rest and not rest[0].strip():
+        rest.pop(0)
+    changelog = "\n".join(rest).rstrip()
+    return version, changelog
+
+
+class MarkdownBlock:
+    def __init__(self, kind, text="", level=0, items=None):
+        self.kind = kind
+        self.text = text
+        self.level = level
+        self.items = items or []
+
+
+def parse_markdown(source):
+    blocks = []
+    for raw in source.splitlines():
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        heading = 0
+        while heading < 6 and stripped[: heading + 1] == "#" * (heading + 1):
+            heading += 1
+        if heading and stripped[heading: heading + 1] == " ":
+            blocks.append(
+                MarkdownBlock("heading", stripped[heading + 1:].strip(), heading)
+            )
+            continue
+        if stripped.startswith(("- ", "* ", "+ ")):
+            text = stripped[2:].strip()
+            if blocks and blocks[-1].kind == "list":
+                blocks[-1].items.append(text)
+            else:
+                blocks.append(MarkdownBlock("list", items=[text]))
+            continue
+        blocks.append(MarkdownBlock("text", stripped))
+    return blocks
+
+
+INLINE_PATTERN = re.compile(
+    r"(\*\*.+?\*\*|`.+?`|\*[^*]+?\*|\[[^\]]+\]\([^)]+\))"
+)
+
+
+def iter_inline_segments(text):
+    result = []
+    for part in INLINE_PATTERN.split(text):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) > 4:
+            result.append(("bold", part[2:-2]))
+        elif part.startswith("`") and part.endswith("`") and len(part) > 2:
+            result.append(("code", part[1:-1]))
+        elif part.startswith("*") and part.endswith("*") and len(part) > 2:
+            result.append(("italic", part[1:-1]))
+        else:
+            m = re.fullmatch(r"\[([^\]]+)\]\(([^)]+)\)", part)
+            if m:
+                result.append(("link", m.group(1), m.group(2)))
+            else:
+                result.append(("plain", part))
+    return result
+
+
+SHELL_TRAY_CLASS = "Shell_TrayWnd"
+
+
+def _shell_window_present():
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(SHELL_TRAY_CLASS, None)
+        return bool(hwnd)
+    except Exception as e:
+        print(f"[Expreload] 检测桌面窗口失败: {e}")
+        return None
+
+
+def _process_scan_for_explorer():
+    try:
+        for pid in psutil.pids():
+            try:
+                name = psutil.Process(pid).name()
+            except Exception:
+                continue
+            if name and name.lower() == EXPLORER_NAME:
+                return True
+    except Exception as e:
+        print(f"[Expreload] 枚举进程失败: {e}")
+    return False
+
+
 class ExplorerMonitor:
     def __init__(self):
         self.missing_since = None
@@ -87,14 +214,10 @@ class ExplorerMonitor:
         self._lock = threading.Lock()
 
     def is_explorer_running(self) -> bool:
-        for proc in psutil.process_iter(["name"]):
-            try:
-                name = proc.info["name"]
-                if name and name.lower() == EXPLORER_NAME:
-                    return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-        return False
+        shell = _shell_window_present()
+        if shell is not None:
+            return shell
+        return _process_scan_for_explorer()
 
     def monitor_loop(self):
         last = None
@@ -154,6 +277,47 @@ def register_hotkey():
         print(f"[Expreload] 快捷键注册失败: {e}")
 
 
+def _patch_pystray_message_filter():
+    try:
+        import pystray._util.win32 as w
+    except Exception as e:
+        print(f"[Expreload] 无法加载 pystray win32 后端: {e}")
+        return
+
+    original = getattr(w, "ChangeWindowMessageFilterEx", None)
+    if original is None:
+        return
+    if getattr(original, "_expreload_patched", False):
+        return
+
+    def safe_filter(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except Exception as e:
+            print(f"[Expreload] 跳过消息过滤设置(非提权运行): {e}")
+            return True
+
+    safe_filter._expreload_patched = True
+    w.ChangeWindowMessageFilterEx = safe_filter
+
+
+def run_tray_icon(icon):
+    try:
+        import ctypes
+
+        ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+    except Exception as e:
+        print(f"[Expreload] 托盘线程 COM 初始化失败: {e}")
+    _patch_pystray_message_filter()
+    try:
+        icon.run()
+    except Exception as e:
+        print(f"[Expreload] 托盘图标启动失败: {e}")
+        import traceback
+
+        traceback.print_exc()
+
+
 def create_tray_icon(app, monitor):
     image = Image.new("RGB", (64, 64), color=(58, 130, 246))
     if os.path.exists(ICON_PATH):
@@ -202,8 +366,11 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         self._restart_btn = None
         self._settings_btn = None
         self._settings_window = None
+        self._settings_root = None
+        self._settings_inner = None
         self._closing = False
         self._root_host = None
+        self._inner_host = None
         self._background_guard = True
         self._theme_index = 0
         self._guard_toggle = None
@@ -232,12 +399,15 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
             self._window.app_window.set_taskbar_icon(ICON_PATH)
 
         self._window.app_window.add_closing(self._on_closing)
-        self._window.content = self._build_ui()
+        built = self._build_ui()
+        self._window.content = built
         self._apply_theme_to_window(self._window)
         self._window.activate()
 
         self._tray_icon = create_tray_icon(self, self._monitor)
-        threading.Thread(target=self._tray_icon.run, daemon=True).start()
+        threading.Thread(
+            target=run_tray_icon, args=(self._tray_icon,), daemon=True
+        ).start()
 
         self._apply_state(self._monitor.is_explorer_running())
 
@@ -253,8 +423,11 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
 
     def _build_ui(self):
         self._root_host = Grid()
-        self._root_host.padding = Thickness(24, 20, 24, 20)
-        self._root_host.children.append(self._build_main_page())
+        inner = Grid()
+        inner.padding = Thickness(24, 20, 24, 20)
+        inner.children.append(self._build_main_page())
+        self._root_host.children.append(inner)
+        self._inner_host = inner
         return self._root_host
 
     def _build_main_page(self):
@@ -388,7 +561,12 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
             win.app_window.set_icon(ICON_PATH)
             win.app_window.set_taskbar_icon(ICON_PATH)
 
-        win.content = self._build_settings_page(win)
+        page = self._build_settings_page(win)
+        outer = Grid()
+        outer.children.append(page)
+        self._settings_root = outer
+        self._settings_inner = page
+        win.content = outer
         win.add_closed(self._on_settings_closed)
         self._settings_window = win
         self._apply_theme_to_window(win)
@@ -396,14 +574,16 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
 
     def _on_settings_closed(self, sender, args):
         self._settings_window = None
+        self._settings_root = None
+        self._settings_inner = None
 
     def _build_settings_page(self, win):
         grid = Grid()
         grid.padding = Thickness(24, 20, 24, 20)
         grid.row_definitions.append(_row(GridUnitType.AUTO))
-        grid.row_definitions.append(_row(GridUnitType.AUTO))
         grid.row_definitions.append(_row(GridUnitType.STAR))
-        grid.row_spacing = 16
+        grid.row_definitions.append(_row(GridUnitType.AUTO))
+        grid.row_spacing = 12
 
         title = self._text("设置", 28, TEXT_PRIMARY)
         Grid.set_row(title, 0)
@@ -439,11 +619,85 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         self._theme_combo.add_selection_changed(self._on_theme_changed)
         body.children.append(self._theme_combo)
 
-        Grid.set_row(body, 1)
+        scroll = ScrollViewer()
+        scroll.vertical_scroll_bar_visibility = ScrollBarVisibility.AUTO
+        scroll.content = body
+        Grid.set_row(scroll, 1)
         body.vertical_alignment = VerticalAlignment.TOP
-        grid.children.append(body)
+        grid.children.append(scroll)
+
+        about = self._build_about_section()
+        Grid.set_row(about, 2)
+        grid.children.append(about)
 
         return grid
+
+    def _build_about_section(self):
+        version, changelog = read_version_info()
+
+        wrap = StackPanel()
+        wrap.spacing = 6
+
+        head = StackPanel()
+        head.orientation = Orientation.HORIZONTAL
+        head.spacing = 8
+
+        about_label = self._text("关于", 15, TEXT_PRIMARY)
+        about_label.vertical_alignment = VerticalAlignment.CENTER
+        head.children.append(about_label)
+
+        ver_label = self._text(version, 12, TEXT_TERTIARY)
+        ver_label.vertical_alignment = VerticalAlignment.CENTER
+        head.children.append(ver_label)
+
+        wrap.children.append(head)
+
+        if changelog:
+            rtb = RichTextBlock()
+            rtb.text_wrapping = TextWrapping.WRAP
+            rtb.margin = Thickness(0, 2, 0, 0)
+            for block in parse_markdown(changelog):
+                rtb.blocks.append(self._markdown_paragraph(block))
+            wrap.children.append(rtb)
+
+        return wrap
+
+    def _markdown_paragraph(self, block):
+        para = Paragraph()
+        if block.kind == "heading":
+            size = {1: 17, 2: 15, 3: 14}.get(block.level, 13)
+            para.font_size = size
+            for seg in iter_inline_segments(block.text):
+                para.inlines.append(self._inline_run(seg, bold_default=True))
+            return para
+
+        if block.kind == "list":
+            for idx, item in enumerate(block.items):
+                if idx:
+                    br = Run()
+                    br.text = "\n"
+                    para.inlines.append(br)
+                bullet = Run()
+                bullet.text = "• "
+                para.inlines.append(bullet)
+                for seg in iter_inline_segments(item):
+                    para.inlines.append(self._inline_run(seg))
+            return para
+
+        para.font_size = 12
+        for seg in iter_inline_segments(block.text):
+            para.inlines.append(self._inline_run(seg))
+        return para
+
+    def _inline_run(self, seg, bold_default=False):
+        kind = seg[0]
+        run = Run()
+        run.text = seg[1]
+        if kind == "code":
+            run.font_family = "Consolas"
+        if kind == "bold" or bold_default:
+            run.font_weight = (700, 5)
+        return run
 
     def _on_guard_toggled(self, sender, args):
         enabled = self._guard_toggle.is_on
@@ -464,7 +718,9 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
         register_hotkey()
         if self._tray_icon is None:
             self._tray_icon = create_tray_icon(self, self._monitor)
-            threading.Thread(target=self._tray_icon.run, daemon=True).start()
+            threading.Thread(
+                target=run_tray_icon, args=(self._tray_icon,), daemon=True
+            ).start()
         self._apply_state(self._monitor.is_explorer_running())
 
     def _stop_guard(self):
@@ -497,16 +753,26 @@ class ExpreloadApp(Application, IXamlMetadataProvider):
             TitleBarTheme.DARK,
         )
         idx = self._theme_index
-        try:
-            content = win.content
-            if content is not None:
-                content.requested_theme = themes[idx]
-        except Exception:
-            pass
+        roots = []
+        if win is self._window:
+            roots = [self._root_host, self._inner_host]
+        elif win is self._settings_window:
+            roots = [self._settings_root, self._settings_inner]
+        for elem in roots:
+            if elem is None:
+                continue
+            try:
+                elem.requested_theme = themes[idx]
+            except Exception as e:
+                print(f"[Expreload] 设置主题失败: {e}", flush=True)
+            try:
+                elem.background = None
+            except Exception as e:
+                print(f"[Expreload] 清除背景失败: {e}", flush=True)
         try:
             win.app_window.title_bar.preferred_theme = title_themes[idx]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Expreload] 应用主题失败(标题栏): {e}", flush=True)
 
     def _resize_window(self, w, h):
         try:
